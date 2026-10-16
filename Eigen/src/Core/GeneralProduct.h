@@ -408,10 +408,39 @@ struct gemv_dense_selector<OnTheLeft, StorageOrder, BlasCompatible> {
   }
 };
 
+// Separate overloads keep C++14 from instantiating the single-column expression for statically empty products.
 template <>
 struct gemv_dense_selector<OnTheRight, ColMajor, true> {
-  template <typename Lhs, typename Rhs, typename Dest>
+  template <typename Lhs, typename Rhs, typename Dest, std::enable_if_t<Lhs::ColsAtCompileTime == 0, int> = 0>
   static inline void run(const Lhs& lhs, const Rhs& rhs, Dest& dest, const typename Dest::Scalar& alpha) {
+    run_general(lhs, rhs, dest, alpha);
+  }
+
+  template <typename Lhs, typename Rhs, typename Dest, std::enable_if_t<Lhs::ColsAtCompileTime != 0, int> = 0>
+  static EIGEN_STRONG_INLINE void run(const Lhs& lhs, const Rhs& rhs, Dest& dest, const typename Dest::Scalar& alpha) {
+    constexpr bool RealScalars =
+        std::is_same<typename Lhs::Scalar, typename Rhs::Scalar>::value &&
+        std::is_same<typename Lhs::Scalar, typename Dest::Scalar>::value &&
+        (std::is_same<typename Dest::Scalar, float>::value || std::is_same<typename Dest::Scalar, double>::value);
+    // Bypass the destination buffer for strided real updates; complex arithmetic benefits from the packet kernel.
+    if (!RealScalars || Dest::InnerStrideAtCompileTime == 1 || lhs.cols() != 1 ||
+        (Dest::InnerStrideAtCompileTime == Dynamic && dest.innerStride() == 1)) {
+      run_general(lhs, rhs, dest, alpha);
+      return;
+    }
+    using LhsBlasTraits = internal::blas_traits<Lhs>;
+    using RhsBlasTraits = internal::blas_traits<Rhs>;
+    typename LhsBlasTraits::DirectLinearAccessType actualLhs = LhsBlasTraits::extract(lhs);
+    typename RhsBlasTraits::DirectLinearAccessType actualRhs = RhsBlasTraits::extract(rhs);
+    const typename Dest::Scalar actualAlpha = combine_scalar_factors(alpha, lhs, rhs);
+    if (numext::is_exactly_zero(actualAlpha)) return;
+    const typename Rhs::Scalar rhsValue = conj_if<RhsBlasTraits::NeedToConjugate>()(actualRhs.coeff(0, 0));
+    dest.col(0).matrix() +=
+        actualAlpha * (actualLhs.col(0).template conjugateIf<LhsBlasTraits::NeedToConjugate>() * rhsValue);
+  }
+
+  template <typename Lhs, typename Rhs, typename Dest>
+  static inline void run_general(const Lhs& lhs, const Rhs& rhs, Dest& dest, const typename Dest::Scalar& alpha) {
     using LhsScalar = typename Lhs::Scalar;
     using RhsScalar = typename Rhs::Scalar;
     using ResScalar = typename Dest::Scalar;
@@ -476,8 +505,35 @@ struct gemv_dense_selector<OnTheRight, ColMajor, true> {
 
 template <>
 struct gemv_dense_selector<OnTheRight, RowMajor, true> {
+  template <typename Lhs, typename Rhs, typename Dest, std::enable_if_t<Lhs::ColsAtCompileTime == 0, int> = 0>
+  static inline void run(const Lhs& lhs, const Rhs& rhs, Dest& dest, const typename Dest::Scalar& alpha) {
+    run_general(lhs, rhs, dest, alpha);
+  }
+
+  template <typename Lhs, typename Rhs, typename Dest, std::enable_if_t<Lhs::ColsAtCompileTime != 0, int> = 0>
+  static EIGEN_STRONG_INLINE void run(const Lhs& lhs, const Rhs& rhs, Dest& dest, const typename Dest::Scalar& alpha) {
+    // Coefficient-wise broadcasts copy scalars; retain GEMV for owning custom scalar types.
+    constexpr bool TriviallyCopyableScalars = std::is_trivially_copyable<typename Lhs::Scalar>::value &&
+                                              std::is_trivially_copyable<typename Rhs::Scalar>::value &&
+                                              std::is_trivially_copyable<typename Dest::Scalar>::value;
+    if (!TriviallyCopyableScalars || lhs.cols() != 1) {
+      run_general(lhs, rhs, dest, alpha);
+      return;
+    }
+    using LhsBlasTraits = internal::blas_traits<Lhs>;
+    using RhsBlasTraits = internal::blas_traits<Rhs>;
+    typename LhsBlasTraits::DirectLinearAccessType actualLhs = LhsBlasTraits::extract(lhs);
+    typename RhsBlasTraits::DirectLinearAccessType actualRhs = RhsBlasTraits::extract(rhs);
+    const typename Dest::Scalar actualAlpha = combine_scalar_factors(alpha, lhs, rhs);
+    if (numext::is_exactly_zero(actualAlpha)) return;
+    const typename Rhs::Scalar rhsValue = conj_if<RhsBlasTraits::NeedToConjugate>()(actualRhs.coeff(0, 0));
+    // Preserve alpha * (lhs * rhs): folding alpha into rhs can overflow before the product.
+    dest.col(0).matrix() +=
+        actualAlpha * (actualLhs.col(0).template conjugateIf<LhsBlasTraits::NeedToConjugate>() * rhsValue);
+  }
+
   template <typename Lhs, typename Rhs, typename Dest>
-  static void run(const Lhs& lhs, const Rhs& rhs, Dest& dest, const typename Dest::Scalar& alpha) {
+  static void run_general(const Lhs& lhs, const Rhs& rhs, Dest& dest, const typename Dest::Scalar& alpha) {
     using LhsScalar = typename Lhs::Scalar;
     using RhsScalar = typename Rhs::Scalar;
     using ResScalar = typename Dest::Scalar;
